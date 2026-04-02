@@ -19,9 +19,13 @@ from __future__ import annotations
 
 import io
 import sys
+import time
 from typing import List
-import requests
+
 import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 STATE_ABBRS: List[str] = [
     "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA",
@@ -33,10 +37,40 @@ STATE_ABBRS: List[str] = [
 
 BASE_URL = "https://data.openstates.org/people/current/{abbr}.csv"
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/146.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,application/csv,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://open.pluralpolicy.com/data/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
 CHAMBER_MAP = {
     "upper": "State Senate",
     "lower": "State House",
 }
+
+def build_session() -> requests.Session:
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=1.0,
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 def normalize_chamber(state: str, chamber_value: str) -> str:
     val = (chamber_value or "").strip().lower()
@@ -44,9 +78,16 @@ def normalize_chamber(state: str, chamber_value: str) -> str:
         return "Unicameral Legislature"
     return CHAMBER_MAP.get(val, chamber_value)
 
-def fetch_state_csv(abbr: str) -> pd.DataFrame:
-    url = BASE_URL.format(abbr=abbr)
-    resp = requests.get(url, timeout=60)
+def fetch_state_csv(session: requests.Session, abbr: str) -> pd.DataFrame:
+    url = BASE_URL.format(abbr=abbr.lower())
+    resp = session.get(url, timeout=60)
+
+    if resp.status_code == 403:
+        raise ValueError(
+            f"{abbr}: HTTP 403 Forbidden for {url}. "
+            "The server rejected the download request."
+        )
+
     resp.raise_for_status()
 
     df = pd.read_csv(io.StringIO(resp.text), dtype=str).fillna("")
@@ -63,7 +104,6 @@ def fetch_state_csv(abbr: str) -> pd.DataFrame:
         "Name": df["name"],
     })
 
-    # Keep only rows that look like active legislators with a chamber and district.
     out = out[
         (out["Name"].str.strip() != "") &
         (out["Chamber"].str.strip() != "") &
@@ -73,14 +113,16 @@ def fetch_state_csv(abbr: str) -> pd.DataFrame:
     return out
 
 def main() -> int:
+    session = build_session()
     frames = []
     errors = []
 
     for abbr in STATE_ABBRS:
         try:
-            df = fetch_state_csv(abbr)
+            df = fetch_state_csv(session, abbr)
             frames.append(df)
             print(f"Fetched {abbr}: {len(df)} rows")
+            time.sleep(0.5)
         except Exception as e:
             errors.append((abbr, str(e)))
             print(f"ERROR {abbr}: {e}", file=sys.stderr)
@@ -91,7 +133,6 @@ def main() -> int:
 
     combined = pd.concat(frames, ignore_index=True)
 
-    # Sort for easy downstream use
     combined["District_sort"] = pd.to_numeric(combined["District"], errors="coerce")
     combined = combined.sort_values(
         by=["State", "Chamber", "District_sort", "District", "Name"],
